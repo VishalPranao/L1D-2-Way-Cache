@@ -16,6 +16,9 @@ module simple_memory
     output line_t                 mem_rsp_data
 );
 
+    // Phase 3 lower memory supplies refill lines only. Dirty-line writes are
+    // deliberately added with the Phase 4 writeback interface.
+
     logic [7:0] memory [0:MEM_BYTES-1];
 
     logic                  busy_q;
