@@ -28,19 +28,15 @@ module tb_l1d_cache;
     l1d_cache dut (
         .clk           (clk),
         .reset_n       (reset_n),
-
         .cpu_req_valid (cpu_req_valid),
         .cpu_req_ready (cpu_req_ready),
         .cpu_req_addr  (cpu_req_addr),
-
         .cpu_rsp_valid (cpu_rsp_valid),
         .cpu_rsp_ready (cpu_rsp_ready),
         .cpu_rsp_rdata (cpu_rsp_rdata),
-
         .mem_req_valid (mem_req_valid),
         .mem_req_ready (mem_req_ready),
         .mem_req_addr  (mem_req_addr),
-
         .mem_rsp_valid (mem_rsp_valid),
         .mem_rsp_ready (mem_rsp_ready),
         .mem_rsp_data  (mem_rsp_data)
@@ -87,12 +83,10 @@ module tb_l1d_cache;
         begin
             expected_data = expected_word(address);
 
-            // Drive request before the active clock edge.
             @(negedge clk);
             cpu_req_addr  = address;
             cpu_req_valid = 1'b1;
 
-            // Wait until the cache accepts the request.
             do begin
                 @(posedge clk);
             end while (!cpu_req_ready);
@@ -100,7 +94,6 @@ module tb_l1d_cache;
             @(negedge clk);
             cpu_req_valid = 1'b0;
 
-            // The cache holds its response until cpu_rsp_ready is asserted.
             wait (cpu_rsp_valid === 1'b1);
             #1;
 
@@ -113,7 +106,6 @@ module tb_l1d_cache;
             $display("PASS: load addr=%08h data=%08h",
                      address, cpu_rsp_rdata);
 
-            // Allow the RESPONSE -> IDLE handshake to complete.
             @(posedge clk);
             wait (cpu_req_ready === 1'b1);
         end
@@ -135,7 +127,6 @@ module tb_l1d_cache;
         end
     endtask
 
-    // Count accepted lower-memory requests and check line alignment.
     always @(posedge clk) begin
         if (!reset_n) begin
             memory_request_count <= 0;
@@ -161,33 +152,64 @@ module tb_l1d_cache;
         @(negedge clk);
         reset_n = 1'b1;
 
-        // Test 1: first access to line 0x1000 must miss and refill.
+        // A: Both ways are invalid, so the first line fills Way 0.
         request_count_before = memory_request_count;
         load_and_check(32'h0000_1004);
         expect_memory_requests(request_count_before + 1,
-                               "cold miss and refill");
+                               "A cold miss fills Way 0");
 
-        // Test 2: 0x100C is in the same 32-byte line, so it must hit.
-        request_count_before = memory_request_count;
-        load_and_check(32'h0000_100C);
-        expect_memory_requests(request_count_before,
-                               "same-line cache hit");
-
-        // Test 3: adding 0x800 keeps the index but changes the tag.
-        // A direct-mapped cache must replace the existing line.
+        // B: Same set, different tag. Way 1 is invalid, so B must use it
+        // instead of replacing A.
         request_count_before = memory_request_count;
         load_and_check(32'h0000_1804);
         expect_memory_requests(request_count_before + 1,
-                               "same-index conflict miss");
+                               "B uses invalid Way 1");
 
-        // Test 4: the original 0x1000 line was evicted, so it misses again.
+        // Prove B is present and can hit from Way 1.
+        request_count_before = memory_request_count;
+        load_and_check(32'h0000_180C);
+        expect_memory_requests(request_count_before,
+                               "B hits in Way 1");
+
+        // Prove A was not evicted when B filled the second way. This access
+        // also makes A most recently used, so B becomes the next LRU victim.
+        request_count_before = memory_request_count;
+        load_and_check(32'h0000_100C);
+        expect_memory_requests(request_count_before,
+                               "A still hits in Way 0");
+
+        // C: A third line mapping to Set 0 arrives. Both ways are valid, so
+        // LRU must evict B, which is currently in Way 1.
+        request_count_before = memory_request_count;
+        load_and_check(32'h0000_2004);
+        expect_memory_requests(request_count_before + 1,
+                               "C causes LRU replacement");
+
+        // A was most recently used before C arrived, so it must remain.
         request_count_before = memory_request_count;
         load_and_check(32'h0000_1004);
+        expect_memory_requests(request_count_before,
+                               "A survived LRU replacement");
+
+        // B should have been the victim, so accessing it must miss now.
+        request_count_before = memory_request_count;
+        load_and_check(32'h0000_1804);
         expect_memory_requests(request_count_before + 1,
-                               "access after conflict eviction");
+                               "B misses after LRU eviction");
+
+        // Access another set and then prove Set 0 was not disturbed.
+        request_count_before = memory_request_count;
+        load_and_check(32'h0000_1024);
+        expect_memory_requests(request_count_before + 1,
+                               "different-set cold miss");
+
+        request_count_before = memory_request_count;
+        load_and_check(32'h0000_1004);
+        expect_memory_requests(request_count_before,
+                               "different set does not disturb Set 0");
 
         $display("--------------------------------------------------");
-        $display("ALL PHASE 1 L1D CACHE TESTS PASSED");
+        $display("ALL PHASE 2 TWO-WAY L1D CACHE TESTS PASSED");
         $display("--------------------------------------------------");
 
         #20;
@@ -195,8 +217,7 @@ module tb_l1d_cache;
     end
 
     initial begin
-        // Prevent an accidental FSM or handshake deadlock from hanging sim.
-        #5000;
+        #8000;
         $fatal(1, "TESTBENCH TIMEOUT");
     end
 
