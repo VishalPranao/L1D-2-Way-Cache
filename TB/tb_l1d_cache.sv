@@ -3,49 +3,53 @@
 module tb_l1d_cache;
     import cache_pkg::*;
 
+    localparam int RESPONSE_LOG_DEPTH = 128;
+
     logic clk;
     logic reset_n;
 
-    logic                  cpu_req_valid;
-    logic                  cpu_req_ready;
-    logic [ADDR_WIDTH-1:0] cpu_req_addr;
-    logic                  cpu_req_write;
-    logic [DATA_WIDTH-1:0] cpu_req_wdata;
-    logic [WORD_BYTES-1:0] cpu_req_wstrb;
+    logic                        cpu_req_valid;
+    logic                        cpu_req_ready;
+    logic [REQ_ID_WIDTH-1:0]     cpu_req_id;
+    logic [ADDR_WIDTH-1:0]       cpu_req_addr;
+    logic                        cpu_req_write;
+    logic [DATA_WIDTH-1:0]       cpu_req_wdata;
+    logic [WORD_BYTES-1:0]       cpu_req_wstrb;
 
-    logic                  cpu_rsp_valid;
-    logic                  cpu_rsp_ready;
-    logic [DATA_WIDTH-1:0] cpu_rsp_rdata;
+    logic                        cpu_rsp_valid;
+    logic                        cpu_rsp_ready;
+    logic [REQ_ID_WIDTH-1:0]     cpu_rsp_id;
+    logic [DATA_WIDTH-1:0]       cpu_rsp_rdata;
 
-    logic                      axi_awvalid;
-    logic                      axi_awready;
-    logic [ADDR_WIDTH-1:0]     axi_awaddr;
-    logic [7:0]                axi_awlen;
-    logic [2:0]                axi_awsize;
-    logic [1:0]                axi_awburst;
+    logic                        axi_awvalid;
+    logic                        axi_awready;
+    logic [ADDR_WIDTH-1:0]       axi_awaddr;
+    logic [7:0]                  axi_awlen;
+    logic [2:0]                  axi_awsize;
+    logic [1:0]                  axi_awburst;
 
-    logic                      axi_wvalid;
-    logic                      axi_wready;
-    logic [AXI_DATA_WIDTH-1:0] axi_wdata;
-    logic [AXI_BYTES-1:0]      axi_wstrb;
-    logic                      axi_wlast;
+    logic                        axi_wvalid;
+    logic                        axi_wready;
+    logic [AXI_DATA_WIDTH-1:0]   axi_wdata;
+    logic [AXI_BYTES-1:0]        axi_wstrb;
+    logic                        axi_wlast;
 
-    logic                      axi_bvalid;
-    logic                      axi_bready;
-    logic [1:0]                axi_bresp;
+    logic                        axi_bvalid;
+    logic                        axi_bready;
+    logic [1:0]                  axi_bresp;
 
-    logic                      axi_arvalid;
-    logic                      axi_arready;
-    logic [ADDR_WIDTH-1:0]     axi_araddr;
-    logic [7:0]                axi_arlen;
-    logic [2:0]                axi_arsize;
-    logic [1:0]                axi_arburst;
+    logic                        axi_arvalid;
+    logic                        axi_arready;
+    logic [ADDR_WIDTH-1:0]       axi_araddr;
+    logic [7:0]                  axi_arlen;
+    logic [2:0]                  axi_arsize;
+    logic [1:0]                  axi_arburst;
 
-    logic                      axi_rvalid;
-    logic                      axi_rready;
-    logic [AXI_DATA_WIDTH-1:0] axi_rdata;
-    logic                      axi_rlast;
-    logic [1:0]                axi_rresp;
+    logic                        axi_rvalid;
+    logic                        axi_rready;
+    logic [AXI_DATA_WIDTH-1:0]   axi_rdata;
+    logic                        axi_rlast;
+    logic [1:0]                  axi_rresp;
 
     integer axi_read_burst_count;
     integer axi_read_beat_count;
@@ -56,6 +60,8 @@ module tb_l1d_cache;
     integer write_beat_monitor;
     integer cpu_request_count;
     integer cpu_response_count;
+    integer hit_under_miss_count;
+    integer second_miss_wait_count;
 
     logic [ADDR_WIDTH-1:0] last_refill_addr;
     logic [ADDR_WIDTH-1:0] last_writeback_addr;
@@ -66,7 +72,16 @@ module tb_l1d_cache;
     integer write_beats_before;
     integer write_responses_before;
 
-    logic [DATA_WIDTH-1:0] d_expected_word;
+    logic [REQ_ID_WIDTH-1:0] response_id_log
+        [0:RESPONSE_LOG_DEPTH-1];
+    logic [DATA_WIDTH-1:0] response_data_log
+        [0:RESPONSE_LOG_DEPTH-1];
+    integer response_log_count;
+    integer next_response_to_check;
+
+    logic [DATA_WIDTH-1:0] expected_store_miss_word;
+    logic [REQ_ID_WIDTH-1:0] stalled_response_id;
+    logic [DATA_WIDTH-1:0] stalled_response_data;
 
     l1d_cache dut (
         .clk           (clk),
@@ -74,6 +89,7 @@ module tb_l1d_cache;
 
         .cpu_req_valid (cpu_req_valid),
         .cpu_req_ready (cpu_req_ready),
+        .cpu_req_id    (cpu_req_id),
         .cpu_req_addr  (cpu_req_addr),
         .cpu_req_write (cpu_req_write),
         .cpu_req_wdata (cpu_req_wdata),
@@ -81,6 +97,7 @@ module tb_l1d_cache;
 
         .cpu_rsp_valid (cpu_rsp_valid),
         .cpu_rsp_ready (cpu_rsp_ready),
+        .cpu_rsp_id    (cpu_rsp_id),
         .cpu_rsp_rdata (cpu_rsp_rdata),
 
         .m_axi_awvalid (axi_awvalid),
@@ -116,7 +133,7 @@ module tb_l1d_cache;
 
     axi_memory_model #(
         .MEM_BYTES    (64 * 1024),
-        .READ_LATENCY (3)
+        .READ_LATENCY (5)
     ) memory_model (
         .clk           (clk),
         .reset_n       (reset_n),
@@ -192,76 +209,102 @@ module tb_l1d_cache;
         end
     endfunction
 
-    task automatic load_and_check(
+    task automatic issue_request(
+        input logic [REQ_ID_WIDTH-1:0] request_id,
         input logic [ADDR_WIDTH-1:0] address,
-        input logic [DATA_WIDTH-1:0] expected_data
-    );
-        begin
-            @(negedge clk);
-            while (cpu_req_ready !== 1'b1)
-                @(negedge clk);
-
-            cpu_req_addr  = address;
-            cpu_req_write = 1'b0;
-            cpu_req_wdata = '0;
-            cpu_req_wstrb = '0;
-            cpu_req_valid = 1'b1;
-
-            @(posedge clk);
-            @(negedge clk);
-            cpu_req_valid = 1'b0;
-
-            wait (cpu_rsp_valid === 1'b1);
-            #1;
-
-            if (cpu_rsp_rdata !== expected_data) begin
-                $error("LOAD FAILED: addr=%08h expected=%08h actual=%08h",
-                       address, expected_data, cpu_rsp_rdata);
-                $fatal(1);
-            end
-
-            $display("PASS LOAD : addr=%08h data=%08h",
-                     address, cpu_rsp_rdata);
-
-            @(posedge clk);
-            @(negedge clk);
-        end
-    endtask
-
-    task automatic store_and_check(
-        input logic [ADDR_WIDTH-1:0] address,
+        input logic write_request,
         input logic [DATA_WIDTH-1:0] write_data,
         input logic [WORD_BYTES-1:0] write_strobe
     );
         begin
             @(negedge clk);
-            while (cpu_req_ready !== 1'b1)
-                @(negedge clk);
-
+            cpu_req_id    = request_id;
             cpu_req_addr  = address;
-            cpu_req_write = 1'b1;
+            cpu_req_write = write_request;
             cpu_req_wdata = write_data;
             cpu_req_wstrb = write_strobe;
             cpu_req_valid = 1'b1;
+            #1;
+
+            while (cpu_req_ready !== 1'b1)
+                @(negedge clk);
 
             @(posedge clk);
             @(negedge clk);
             cpu_req_valid = 1'b0;
+        end
+    endtask
 
-            wait (cpu_rsp_valid === 1'b1);
-            #1;
+    task automatic issue_load(
+        input logic [REQ_ID_WIDTH-1:0] request_id,
+        input logic [ADDR_WIDTH-1:0] address
+    );
+        begin
+            issue_request(request_id, address, 1'b0, '0, '0);
+        end
+    endtask
 
-            if (cpu_rsp_rdata !== '0) begin
-                $error("STORE RESPONSE FAILED: addr=%08h response=%08h",
-                       address, cpu_rsp_rdata);
+    task automatic issue_store(
+        input logic [REQ_ID_WIDTH-1:0] request_id,
+        input logic [ADDR_WIDTH-1:0] address,
+        input logic [DATA_WIDTH-1:0] write_data,
+        input logic [WORD_BYTES-1:0] write_strobe
+    );
+        begin
+            issue_request(request_id, address, 1'b1,
+                          write_data, write_strobe);
+        end
+    endtask
+
+    task automatic expect_response(
+        input logic [REQ_ID_WIDTH-1:0] expected_id,
+        input logic [DATA_WIDTH-1:0] expected_data,
+        input string test_name
+    );
+        begin
+            while (response_log_count <= next_response_to_check)
+                @(negedge clk);
+
+            if (response_id_log[next_response_to_check] !== expected_id
+                || response_data_log[next_response_to_check]
+                   !== expected_data) begin
+                $error("%s: response mismatch", test_name);
+                $display("  expected id=%0d data=%08h",
+                         expected_id, expected_data);
+                $display("  actual   id=%0d data=%08h",
+                         response_id_log[next_response_to_check],
+                         response_data_log[next_response_to_check]);
                 $fatal(1);
             end
 
-            $display("PASS STORE: addr=%08h data=%08h strobe=%04b",
-                     address, write_data, write_strobe);
+            $display("PASS RSP  : %-42s id=%0d data=%08h",
+                     test_name, expected_id, expected_data);
+            next_response_to_check = next_response_to_check + 1;
+        end
+    endtask
 
-            @(posedge clk);
-            @(negedge clk);
+    task automatic load_and_check(
+        input logic [REQ_ID_WIDTH-1:0] request_id,
+        input logic [ADDR_WIDTH-1:0] address,
+        input logic [DATA_WIDTH-1:0] expected_data,
+        input string test_name
+    );
+        begin
+            issue_load(request_id, address);
+            expect_response(request_id, expected_data, test_name);
+        end
+    endtask
+
+    task automatic store_and_check(
+        input logic [REQ_ID_WIDTH-1:0] request_id,
+        input logic [ADDR_WIDTH-1:0] address,
+        input logic [DATA_WIDTH-1:0] write_data,
+        input logic [WORD_BYTES-1:0] write_strobe,
+        input string test_name
+    );
+        begin
+            issue_store(request_id, address, write_data, write_strobe);
+            expect_response(request_id, '0, test_name);
         end
     endtask
 
@@ -281,7 +324,7 @@ module tb_l1d_cache;
         input integer expected_writes,
         input integer expected_write_beats,
         input integer expected_write_responses,
-        input string  test_name
+        input string test_name
     );
         begin
             if ((axi_read_burst_count - reads_before) != expected_reads
@@ -315,27 +358,45 @@ module tb_l1d_cache;
         end
     endtask
 
-    // AXI and CPU protocol monitor.
+    // AXI and CPU protocol monitor plus a response log used to check explicit
+    // out-of-order completion by request ID.
     always @(posedge clk) begin
         if (!reset_n) begin
-            axi_read_burst_count      <= 0;
-            axi_read_beat_count       <= 0;
-            axi_write_burst_count     <= 0;
-            axi_write_beat_count      <= 0;
-            axi_write_response_count  <= 0;
-            read_beat_monitor          <= 0;
-            write_beat_monitor         <= 0;
-            cpu_request_count          <= 0;
-            cpu_response_count         <= 0;
-            last_refill_addr            <= '0;
-            last_writeback_addr         <= '0;
+            axi_read_burst_count     <= 0;
+            axi_read_beat_count      <= 0;
+            axi_write_burst_count    <= 0;
+            axi_write_beat_count     <= 0;
+            axi_write_response_count <= 0;
+            read_beat_monitor         <= 0;
+            write_beat_monitor        <= 0;
+            cpu_request_count         <= 0;
+            cpu_response_count        <= 0;
+            hit_under_miss_count      <= 0;
+            second_miss_wait_count    <= 0;
+            response_log_count        <= 0;
+            last_refill_addr          <= '0;
+            last_writeback_addr       <= '0;
         end
         else begin
             if (cpu_req_valid && cpu_req_ready)
                 cpu_request_count <= cpu_request_count + 1;
 
-            if (cpu_rsp_valid && cpu_rsp_ready)
+            if (cpu_rsp_valid && cpu_rsp_ready) begin
                 cpu_response_count <= cpu_response_count + 1;
+
+                if (response_log_count >= RESPONSE_LOG_DEPTH)
+                    $fatal(1, "Response log overflow");
+
+                response_id_log[response_log_count] <= cpu_rsp_id;
+                response_data_log[response_log_count] <= cpu_rsp_rdata;
+                response_log_count <= response_log_count + 1;
+
+                if (dut.mshr_valid_q)
+                    hit_under_miss_count <= hit_under_miss_count + 1;
+            end
+
+            if (dut.lookup_state_q == LOOKUP_WAIT_MSHR)
+                second_miss_wait_count <= second_miss_wait_count + 1;
 
             if (axi_arvalid && axi_arready) begin
                 axi_read_burst_count <= axi_read_burst_count + 1;
@@ -368,7 +429,7 @@ module tb_l1d_cache;
             if (axi_awvalid && axi_awready) begin
                 axi_write_burst_count <= axi_write_burst_count + 1;
                 write_beat_monitor    <= 0;
-                last_writeback_addr  <= axi_awaddr;
+                last_writeback_addr   <= axi_awaddr;
 
                 if (axi_awaddr[OFFSET_BITS-1:0] != '0
                     || axi_awlen != AXI_LINE_LEN
@@ -381,9 +442,8 @@ module tb_l1d_cache;
             if (axi_wvalid && axi_wready) begin
                 axi_write_beat_count <= axi_write_beat_count + 1;
 
-                if (axi_wstrb != {AXI_BYTES{1'b1}}) begin
+                if (axi_wstrb != {AXI_BYTES{1'b1}})
                     $fatal(1, "Writeback beat did not enable all bytes");
-                end
 
                 if (axi_wlast
                     != (write_beat_monitor == AXI_BEATS_PER_LINE - 1)) begin
@@ -404,98 +464,174 @@ module tb_l1d_cache;
     end
 
     initial begin
-        reset_n       = 1'b0;
-        cpu_req_valid = 1'b0;
-        cpu_req_addr  = '0;
-        cpu_req_write = 1'b0;
-        cpu_req_wdata = '0;
-        cpu_req_wstrb = '0;
-        cpu_rsp_ready = 1'b1;
+        reset_n               = 1'b0;
+        cpu_req_valid         = 1'b0;
+        cpu_req_id            = '0;
+        cpu_req_addr          = '0;
+        cpu_req_write         = 1'b0;
+        cpu_req_wdata         = '0;
+        cpu_req_wstrb         = '0;
+        cpu_rsp_ready         = 1'b1;
+        next_response_to_check = 0;
 
         repeat (3) @(posedge clk);
         @(negedge clk);
         reset_n = 1'b1;
 
-        // A: cold miss into Set 0, Way 0. One eight-beat AXI read burst.
+        // Prime a line that later requests can hit while unrelated misses are
+        // active in the MSHR.
+        load_and_check(4'd0, 32'h0000_0104,
+                       expected_word(32'h0000_0104),
+                       "prime hit-under-miss line H");
+
+        // A younger load hit completes before the older clean miss. The IDs
+        // prove that the response order is intentional and unambiguous.
         save_axi_counts();
-        load_and_check(32'h0000_1004, expected_word(32'h0000_1004));
+        issue_load(4'd1, 32'h0000_0404);
+        issue_load(4'd2, 32'h0000_0104);
+        expect_response(4'd2, expected_word(32'h0000_0104),
+                        "younger load hit bypasses older miss");
+        expect_response(4'd1, expected_word(32'h0000_0404),
+                        "older clean miss completes after hit");
         expect_axi_delta(1, 8, 0, 0, 0,
-                         "cold load A uses one AXI refill burst");
+                         "load hit-under-miss uses one refill");
 
-        // Make A dirty. Store and following load must remain cache hits.
+        // Store hits are also allowed under a miss and still mark their line
+        // dirty. A following hit observes the stored value.
         save_axi_counts();
-        store_and_check(32'h0000_1004, 32'hDEAD_BEEF, 4'b1111);
-        load_and_check(32'h0000_1004, 32'hDEAD_BEEF);
-        expect_axi_delta(0, 0, 0, 0, 0,
-                         "store hit and read-after-write stay in cache");
-
-        if (dut.dirty_array[0][0] !== 1'b1)
-            $fatal(1, "A should be dirty in Set 0 Way 0");
-
-        // B maps to Set 0 and fills the still-invalid Way 1.
-        save_axi_counts();
-        load_and_check(32'h0000_1804, expected_word(32'h0000_1804));
+        issue_load(4'd3, 32'h0000_0444);
+        issue_store(4'd4, 32'h0000_0104, 32'hDEAD_BEEF, 4'b1111);
+        expect_response(4'd4, '0,
+                        "store hit completes under clean miss");
+        expect_response(4'd3, expected_word(32'h0000_0444),
+                        "clean miss completes after store hit");
         expect_axi_delta(1, 8, 0, 0, 0,
-                         "B fills invalid Way 1 without writeback");
+                         "store hit-under-miss adds no AXI transfer");
+        load_and_check(4'd5, 32'h0000_0104, 32'hDEAD_BEEF,
+                       "read-after-write of under-miss store");
 
-        // C is a third Set-0 line. A is the LRU victim and is dirty, so C
-        // forces an eight-beat writeback followed by an eight-beat refill.
+        // A request to the line currently being refilled cannot hit stale
+        // data. It waits, refreshes its array snapshot, then hits the install.
         save_axi_counts();
-        load_and_check(32'h0000_2004, expected_word(32'h0000_2004));
+        issue_load(4'd6, 32'h0000_0800);
+        issue_load(4'd7, 32'h0000_0804);
+        expect_response(4'd6, expected_word(32'h0000_0800),
+                        "original same-line miss response");
+        expect_response(4'd7, expected_word(32'h0000_0804),
+                        "same-line request retries after install");
+        expect_axi_delta(1, 8, 0, 0, 0,
+                         "same-line waiter does not launch second refill");
+
+        // A true second miss is accepted into the lookup slot but waits for
+        // the one MSHR. The two refills occur serially, not concurrently.
+        save_axi_counts();
+        issue_load(4'd8, 32'h0000_0844);
+        issue_load(4'd9, 32'h0000_0884);
+        expect_response(4'd8, expected_word(32'h0000_0844),
+                        "first of two serialized misses");
+        expect_response(4'd9, expected_word(32'h0000_0884),
+                        "second miss starts after MSHR frees");
+        expect_axi_delta(2, 16, 0, 0, 0,
+                         "single MSHR serializes two misses");
+
+        // Build a dirty LRU victim: A and B map to the same set, then C is a
+        // third line in that set. H can still hit during A's writeback/refill.
+        load_and_check(4'd10, 32'h0000_1144,
+                       expected_word(32'h0000_1144),
+                       "fill conflict line A");
+        store_and_check(4'd11, 32'h0000_1144,
+                        32'hCAFE_BABE, 4'b1111,
+                        "make conflict line A dirty");
+        load_and_check(4'd12, 32'h0000_1944,
+                       expected_word(32'h0000_1944),
+                       "fill conflict line B");
+
+        save_axi_counts();
+        issue_load(4'd13, 32'h0000_2144);
+        issue_load(4'd14, 32'h0000_0104);
+        expect_response(4'd14, 32'hDEAD_BEEF,
+                        "hit proceeds during dirty writeback miss");
+        expect_response(4'd13, expected_word(32'h0000_2144),
+                        "dirty miss completes after writeback/refill");
         expect_axi_delta(1, 8, 1, 8, 1,
-                         "dirty A writeback occurs before C refill");
+                         "dirty miss uses writeback then refill");
 
-        if (last_writeback_addr !== 32'h0000_1000
-            || last_refill_addr !== 32'h0000_2000) begin
+        if (last_writeback_addr !== 32'h0000_1140
+            || last_refill_addr !== 32'h0000_2140) begin
             $fatal(1,
                 "Wrong dirty-miss addresses: writeback=%08h refill=%08h",
                 last_writeback_addr, last_refill_addr);
         end
 
-        // Reloading A misses, but lower memory must now contain DEADBEEF from
-        // the preceding writeback. B is clean, so no second writeback occurs.
-        save_axi_counts();
-        load_and_check(32'h0000_1004, 32'hDEAD_BEEF);
-        expect_axi_delta(1, 8, 0, 0, 0,
-                         "A refill observes data written back to memory");
+        load_and_check(4'd15, 32'h0000_1144, 32'hCAFE_BABE,
+                       "reload observes dirty victim writeback");
 
-        // Regression of Phase-3 byte masking on the refilled A line.
-        save_axi_counts();
-        store_and_check(32'h0000_1005, 32'h0000_AA00, 4'b0010);
-        load_and_check(32'h0000_1004, 32'hDEAD_AAEF);
-        expect_axi_delta(0, 0, 0, 0, 0,
-                         "byte store hit updates only selected lane");
-
-        // C remains in the other way after A is reloaded.
-        save_axi_counts();
-        load_and_check(32'h0000_2004, expected_word(32'h0000_2004));
-        expect_axi_delta(0, 0, 0, 0, 0,
-                         "C remains present in the other way");
-
-        // Store miss in Set 1: AXI refill, replay masked store, mark dirty.
-        d_expected_word = merge_word(
-            expected_word(32'h0000_1024),
+        // A store miss is merged into the MSHR refill before installation. It
+        // needs one read burst and no replay through the lookup controller.
+        expected_store_miss_word = merge_word(
+            expected_word(32'h0000_0C20),
             32'h1234_0000,
             4'b1100
         );
-
         save_axi_counts();
-        store_and_check(32'h0000_1026, 32'h1234_0000, 4'b1100);
-        load_and_check(32'h0000_1024, d_expected_word);
+        store_and_check(4'd1, 32'h0000_0C22,
+                        32'h1234_0000, 4'b1100,
+                        "store miss merges into refill line");
+        load_and_check(4'd2, 32'h0000_0C20,
+                       expected_store_miss_word,
+                       "load observes merged store-miss bytes");
         expect_axi_delta(1, 8, 0, 0, 0,
-                         "store miss uses AXI write allocation and replay");
+                         "store miss performs one refill only");
 
-        if (dut.dirty_array[1][0] !== 1'b1)
-            $fatal(1, "Store-miss line in Set 1 should be dirty");
+        // Hold response READY low and verify the registered response payload
+        // remains unchanged until it is accepted.
+        save_axi_counts();
+        @(negedge clk);
+        cpu_rsp_ready = 1'b0;
+        issue_load(4'd3, 32'h0000_0C64);
 
+        while (cpu_rsp_valid !== 1'b1)
+            @(negedge clk);
+
+        stalled_response_id   = cpu_rsp_id;
+        stalled_response_data = cpu_rsp_rdata;
+
+        repeat (4) begin
+            @(negedge clk);
+            if (cpu_rsp_valid !== 1'b1
+                || cpu_rsp_id !== stalled_response_id
+                || cpu_rsp_rdata !== stalled_response_data) begin
+                $fatal(1, "CPU response changed while READY was low");
+            end
+        end
+
+        cpu_rsp_ready = 1'b1;
+        expect_response(4'd3, expected_word(32'h0000_0C64),
+                        "response remains stable under backpressure");
+        expect_axi_delta(1, 8, 0, 0, 0,
+                         "backpressured miss still uses one refill");
+
+        if (hit_under_miss_count < 3) begin
+            $fatal(1,
+                "Expected at least three responses while MSHR was active; got %0d",
+                hit_under_miss_count);
+        end
+
+        if (second_miss_wait_count == 0)
+            $fatal(1, "LOOKUP_WAIT_MSHR was never exercised");
+
+        @(negedge clk);
         if (cpu_request_count != cpu_response_count) begin
             $fatal(1,
                 "CPU request/response mismatch: requests=%0d responses=%0d",
                 cpu_request_count, cpu_response_count);
         end
 
+        if (dut.mshr_valid_q !== 1'b0)
+            $fatal(1, "MSHR should be free at end of test");
+
         $display("--------------------------------------------------");
-        $display("ALL PHASE 4 PIPELINE, WRITEBACK AND AXI TESTS PASSED");
+        $display("ALL PHASE 5 ONE-MSHR AND HIT-UNDER-MISS TESTS PASSED");
         $display("--------------------------------------------------");
 
         #20;
@@ -503,7 +639,7 @@ module tb_l1d_cache;
     end
 
     initial begin
-        #20000;
+        #50000;
         $fatal(1, "TESTBENCH TIMEOUT");
     end
 
