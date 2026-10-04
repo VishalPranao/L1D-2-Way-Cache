@@ -1,9 +1,8 @@
-# Phase 5: Non-Blocking L1D Cache with One MSHR
+# Phase 6: Multi-MSHR Non-Blocking L1D Cache
 
-This phase builds directly on the Phase 4 pipelined, write-back AXI cache. It
-adds one miss-status holding register (MSHR), separates lookup from miss
-handling, and permits load or store hits to complete while one older miss is
-being written back or refilled.
+Phase 6 builds on the Phase 5 one-MSHR cache and adds true miss-under-miss
+execution. Four independent misses can own MSHRs simultaneously, several AXI
+read requests may be outstanding, and responses are routed with AXI IDs.
 
 ## Configuration
 
@@ -12,92 +11,116 @@ being written back or refilled.
 - 32-byte cache lines
 - 64 sets and 2 ways per set
 - 4 KiB data capacity
-- LRU replacement
 - write-back and write-allocate policy
 - byte-enabled stores
-- one MSHR and one AXI memory transaction at a time
-- 32-bit AXI4 data bus and eight beats per cache line
+- four MSHRs
+- four dependent requests per MSHR
+- 16-entry CPU response FIFO
+- 32-bit AXI4 data bus and eight beats per line
+- 2-bit AXI IDs, with each AXI ID equal to its MSHR index
 
-## What Changed from Phase 4
+The concurrency parameters are in `rtl/cache_pkg.sv`:
 
-Phase 4 had one global blocking FSM. Once a miss occurred, that FSM stopped all
-new CPU lookups until writeback, refill, install, and response were complete.
-
-Phase 5 has two independent controllers:
-
-1. The lookup controller accepts a request, reads both ways, compares tags, and
-   completes cache hits.
-2. The miss engine owns the single MSHR and performs dirty writeback, refill,
-   and installation through AXI.
-
-Because the controllers run concurrently, a younger hit can respond before the
-older miss. `cpu_req_id` is copied to `cpu_rsp_id` so the CPU can identify these
-out-of-order responses.
-
-## One-MSHR Behavior
-
-The MSHR stores the complete context of one miss:
-
-- request ID, load/store type, write data, and byte strobes,
-- requested line address, tag, set, and word index,
-- selected victim way, victim address, and victim data,
-- refill buffer and AXI beat counter.
-
-At allocation, the selected victim way is invalidated immediately. Its complete
-data is already snapshotted in the MSHR, so later hits cannot read stale victim
-data or modify a line while it is being written back.
-
-A store miss is merged directly into the completed refill buffer before the
-line is installed. It does not replay through the lookup pipeline.
-
-## Supported Concurrency
-
-| Request while MSHR is busy | Phase 5 action |
-| --- | --- |
-| Hit in a non-reserved cache way | Complete normally; may respond before the miss |
-| Store hit in a non-reserved way | Update bytes, set dirty, and respond |
-| Request to the line being refilled | Wait, refresh array data after install, then hit |
-| A different cache miss | Wait in `LOOKUP_WAIT_MSHR`, then retry after the MSHR frees |
-
-The last row is intentionally not miss-under-miss. Multiple outstanding misses,
-request merging, and multiple MSHRs belong to Phase 6.
-
-## Controller Sequences
-
-Lookup controller:
-
-```text
-LOOKUP_IDLE -> LOOKUP_COMPARE -> hit response
-                               -> MSHR allocation
-                               -> LOOKUP_WAIT_MSHR -> LOOKUP_REFRESH -> compare
+```systemverilog
+parameter int NUM_MSHRS      = 4;
+parameter int MERGE_DEPTH    = 4;
+parameter int RESPONSE_DEPTH = 16;
 ```
 
-Clean or invalid victim:
+## Major Changes from Phase 5
+
+| Function | Phase 5 | Phase 6 |
+| --- | --- | --- |
+| MSHRs | One | Four |
+| Additional independent miss | Waits | Allocates another MSHR |
+| Same-line secondary miss | Waits and retries | Merges into the existing MSHR |
+| AXI reads | One outstanding | Several outstanding with `ARID/RID` |
+| CPU responses | One response register | 16-entry response FIFO |
+| Victim protection | One invalidated victim | Explicit per-set/per-way reservations |
+| Refill completion | One possible installer | Installation arbiter |
+| Dirty writeback | One miss engine | Several pending; one serialized W burst at a time |
+
+## Request Decision Order
+
+For each lookup, the controller follows this order:
+
+1. Cache hit: return or modify the cached word.
+2. Active MSHR line match: append the request to that MSHR's merge queue.
+3. Reserved-victim address match: wait so stale dirty-victim memory cannot be
+   read before writeback.
+4. New miss: select an unreserved victim and allocate a free MSHR.
+5. No resource: refresh the array snapshot and retry.
+
+This ordering prevents duplicate MSHRs for one line and prevents two MSHRs from
+reserving the same physical cache way.
+
+## Same-Line Merging
+
+Each MSHR holds as many as four ordered dependent requests. A request record
+contains its CPU ID, load/store type, word index, store data, and byte strobes.
+
+After refill:
 
 ```text
-MISS_IDLE -> MISS_REFILL_AR -> MISS_REFILL_R -> MISS_INSTALL -> MISS_IDLE
+MSHR_PREPARE
+  -> MSHR_APPLY request 0
+  -> MSHR_APPLY request 1
+  -> ...
+  -> MSHR_INSTALL_PENDING
+  -> MSHR_FREE
 ```
 
-Dirty victim:
+Operations are applied in arrival order. Therefore, a merged load following a
+merged store to the same word observes the store-modified data. At least one
+effective store marks the installed line dirty.
+
+## AXI Read Concurrency
+
+The read-address arbiter selects an MSHR in `MSHR_REFILL_REQUEST`, latches its
+index, and sends:
 
 ```text
-MISS_IDLE
-  -> MISS_WRITEBACK_AW
-  -> MISS_WRITEBACK_W (8 beats)
-  -> MISS_WRITEBACK_B
-  -> MISS_REFILL_AR
-  -> MISS_REFILL_R (8 beats)
-  -> MISS_INSTALL
-  -> MISS_IDLE
+ARID   = MSHR index
+ARADDR = requested line address
+ARLEN  = 7
 ```
+
+The return path uses `RID` to choose the correct refill buffer and per-MSHR beat
+counter. Different IDs may complete out of request order.
+
+The supplied memory model accepts one outstanding read per AXI ID. It returns
+complete bursts without beat interleaving, but deliberately gives higher IDs a
+shorter initial latency so the testbench observes out-of-order completion.
+
+## Dirty Writeback
+
+Several MSHRs may wait in `MSHR_WRITEBACK_PENDING`. The writeback arbiter grants
+one entry and sends its complete burst through `AW/W/B` before granting another.
+This is intentional because AXI4 has no `WID`; write-data bursts are not mixed.
+
+Independent clean-miss AXI reads can still proceed while a dirty writeback is
+active.
+
+## Set and Way Conflict Safety
+
+`reserved_array[set][way]` records ways owned by MSHRs.
+
+- A reserved way cannot hit.
+- Victim selection ignores reserved ways.
+- Two misses to the two different ways of one set may proceed.
+- A third different-line miss to that two-way set waits.
+- A request for an evicted victim address waits until the owning MSHR finishes.
+- The install arbiter writes only one completed refill into the arrays per
+  cycle.
 
 ## Files
 
 ```text
-l1d-cache-phase5-mshr/
+l1d-cache-phase6-multi-mshr/
 |-- README.md
 |-- rtl/
 |   |-- cache_pkg.sv
+|   |-- response_fifo.sv
 |   `-- l1d_cache.sv
 `-- tb/
     |-- axi_memory_model.sv
@@ -109,48 +132,65 @@ l1d-cache-phase5-mshr/
 Create a project and compile in this order:
 
 1. `rtl/cache_pkg.sv`
-2. `rtl/l1d_cache.sv`
-3. `tb/axi_memory_model.sv`
-4. `tb/tb_l1d_cache.sv`
+2. `rtl/response_fifo.sv`
+3. `rtl/l1d_cache.sv`
+4. `tb/axi_memory_model.sv`
+5. `tb/tb_l1d_cache.sv`
 
 Simulate `tb_l1d_cache`, then choose **Run > Run -All**.
 
-Expected final message:
+Expected completion message:
 
 ```text
-ALL PHASE 5 ONE-MSHR AND HIT-UNDER-MISS TESTS PASSED
+ALL PHASE 6 MULTI-MSHR AND MISS-UNDER-MISS TESTS PASSED
 ```
 
-Useful internal signals to add to the Wave window:
+Useful Wave-window signals include:
 
 - `dut.lookup_state_q`
-- `dut.miss_state_q`
 - `dut.mshr_valid_q`
-- `dut.mshr_req_id_q`
+- `dut.mshr_state_q`
 - `dut.mshr_line_addr_q`
-- `cpu_req_valid`, `cpu_req_ready`, and `cpu_req_id`
-- `cpu_rsp_valid`, `cpu_rsp_ready`, and `cpu_rsp_id`
-- all five AXI channel handshakes
+- `dut.mshr_req_count_q`
+- `dut.reserved_array`
+- `dut.writeback_state_q`
+- `dut.ar_hold_valid_q` and `dut.ar_hold_index_q`
+- `dut.response_queue.count_q`
+- CPU request and response IDs
+- AXI `ARID`, `RID`, `AWID`, and `BID`
 
 ## Directed Verification
 
 The testbench checks:
 
-- load hit under a clean miss with out-of-order response IDs,
-- store hit under miss and read-after-write,
-- a same-line request waiting and retrying after refill,
-- a second miss waiting for the single MSHR,
-- dirty victim writeback with a concurrent unrelated hit,
-- victim writeback data reaching lower memory,
-- direct masked-store merge into a refill line,
-- exactly eight AXI beats per cache line,
-- aligned AXI addresses and correct burst fields,
-- stable CPU response payload under backpressure,
+- two independent concurrent misses,
+- a cache hit under multiple misses,
+- out-of-order AXI completion and CPU response IDs,
+- three same-line loads sharing one refill,
+- store-miss plus load merging with correct operation ordering,
+- all four MSHRs occupied and a fifth miss retrying,
+- two reserved ways and a third same-set miss waiting,
+- dirty writeback concurrent with an independent clean refill,
+- dirty victim data reaching lower memory,
+- response FIFO payload stability under CPU backpressure,
+- correct burst length, alignment, IDs, `RLAST`, and `WLAST`,
 - one response for every accepted CPU request.
 
-## Remaining Plan
+The RTL also contains simulation assertions for duplicate line ownership,
+duplicate victim reservation, merge queue overflow, AXI response errors, and
+incorrect burst termination.
 
-- **Phase 6:** multiple MSHRs, miss-under-miss, same-line merging, AXI IDs,
-  wakeup/replay, and set-conflict safety.
-- **Phase 7:** complete corner-case control, ordering rules, maintenance,
-  error handling, assertions, randomized verification, and coverage.
+## Intentional Phase 6 Limits
+
+- Four MSHRs and four merged requests per line are fixed educational defaults.
+- AXI writebacks are serialized.
+- The lookup pipe holds one unresolved request when all resources are busy.
+- Global load/store ordering, fences, atomics, cache flush/invalidate commands,
+  AXI error recovery, and coherence are reserved for Phase 7.
+
+## Remaining Phase
+
+Phase 7 completes the control plane with architectural ordering rules,
+maintenance operations, error recovery, fairness improvements, stronger
+assertions, randomized verification, functional coverage, and final corner-case
+handling.
