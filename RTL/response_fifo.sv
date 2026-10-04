@@ -10,11 +10,14 @@ module response_fifo
     output logic                    push_ready,
     input  logic [REQ_ID_WIDTH-1:0] push_id,
     input  logic [DATA_WIDTH-1:0]   push_data,
+    input  logic                    push_error,
 
     output logic                    pop_valid,
     input  logic                    pop_ready,
     output logic [REQ_ID_WIDTH-1:0] pop_id,
-    output logic [DATA_WIDTH-1:0]   pop_data
+    output logic [DATA_WIDTH-1:0]   pop_data,
+    output logic                    pop_error,
+    output logic                    empty
 );
 
     localparam int POINTER_WIDTH = $clog2(DEPTH);
@@ -22,6 +25,7 @@ module response_fifo
 
     logic [REQ_ID_WIDTH-1:0] id_memory [0:DEPTH-1];
     logic [DATA_WIDTH-1:0] data_memory [0:DEPTH-1];
+    logic error_memory [0:DEPTH-1];
 
     logic [POINTER_WIDTH-1:0] read_pointer_q;
     logic [POINTER_WIDTH-1:0] write_pointer_q;
@@ -34,6 +38,8 @@ module response_fifo
     assign pop_valid  = (count_q != 0);
     assign pop_id     = id_memory[read_pointer_q];
     assign pop_data   = data_memory[read_pointer_q];
+    assign pop_error  = error_memory[read_pointer_q];
+    assign empty      = (count_q == 0);
 
     assign push_fire = push_valid && push_ready;
     assign pop_fire  = pop_valid && pop_ready;
@@ -48,6 +54,7 @@ module response_fifo
             if (push_fire) begin
                 id_memory[write_pointer_q]   <= push_id;
                 data_memory[write_pointer_q] <= push_data;
+                error_memory[write_pointer_q] <= push_error;
                 write_pointer_q <= write_pointer_q + 1'b1;
             end
 

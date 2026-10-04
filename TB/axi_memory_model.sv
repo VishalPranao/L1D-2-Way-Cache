@@ -7,6 +7,11 @@ module axi_memory_model
     input  logic                      clk,
     input  logic                      reset_n,
 
+    // Simple directed-test error injection.  Hold a control high until the
+    // corresponding AR/AW handshake; that whole transaction returns SLVERR.
+    input  logic                      force_read_error,
+    input  logic                      force_write_error,
+
     input  logic                      s_axi_awvalid,
     output logic                      s_axi_awready,
     input  logic [AXI_ID_WIDTH-1:0]   s_axi_awid,
@@ -51,6 +56,7 @@ module axi_memory_model
     logic [7:0]            read_len_q [0:NUM_MSHRS-1];
     logic [7:0]            read_beat_q [0:NUM_MSHRS-1];
     integer                read_wait_q [0:NUM_MSHRS-1];
+    logic                  read_error_q [0:NUM_MSHRS-1];
 
     logic                  ready_read_valid;
     axi_id_t               ready_read_id;
@@ -59,6 +65,7 @@ module axi_memory_model
     axi_id_t               r_stream_id_q;
     logic [AXI_DATA_WIDTH-1:0] r_stream_data_q;
     logic                  r_stream_last_q;
+    logic                  r_stream_error_q;
 
     logic                  write_active_q;
     logic [ADDR_WIDTH-1:0] write_base_q;
@@ -67,6 +74,8 @@ module axi_memory_model
     axi_id_t               write_id_q;
     logic                  bvalid_q;
     axi_id_t               bid_q;
+    logic                  write_error_q;
+    logic [1:0]            bresp_q;
 
     integer init_byte_number;
     integer read_slot_number;
@@ -107,13 +116,14 @@ module axi_memory_model
     assign s_axi_rid    = r_stream_id_q;
     assign s_axi_rdata  = r_stream_data_q;
     assign s_axi_rlast  = r_stream_last_q;
-    assign s_axi_rresp  = AXI_RESP_OKAY;
+    assign s_axi_rresp  = r_stream_error_q
+                          ? AXI_RESP_SLVERR : AXI_RESP_OKAY;
 
     assign s_axi_awready = !write_active_q && !bvalid_q;
     assign s_axi_wready  = write_active_q;
     assign s_axi_bvalid  = bvalid_q;
     assign s_axi_bid     = bid_q;
-    assign s_axi_bresp   = AXI_RESP_OKAY;
+    assign s_axi_bresp   = bresp_q;
 
     always_comb begin
         ready_read_valid = 1'b0;
@@ -137,6 +147,7 @@ module axi_memory_model
             r_stream_id_q    <= '0;
             r_stream_data_q  <= '0;
             r_stream_last_q  <= 1'b0;
+            r_stream_error_q <= 1'b0;
 
             for (read_slot_number = 0;
                  read_slot_number < NUM_MSHRS;
@@ -146,6 +157,7 @@ module axi_memory_model
                 read_len_q[read_slot_number]   <= '0;
                 read_beat_q[read_slot_number]  <= '0;
                 read_wait_q[read_slot_number]  <= 0;
+                read_error_q[read_slot_number] <= 1'b0;
             end
         end
         else begin
@@ -154,6 +166,7 @@ module axi_memory_model
                 read_base_q[s_axi_arid]  <= s_axi_araddr;
                 read_len_q[s_axi_arid]   <= s_axi_arlen;
                 read_beat_q[s_axi_arid]  <= '0;
+                read_error_q[s_axi_arid] <= force_read_error;
 
                 // Higher IDs receive shorter initial latency. This makes the
                 // testbench observe legal out-of-order read completion.
@@ -184,6 +197,7 @@ module axi_memory_model
                 r_stream_last_q <=
                     (read_beat_q[ready_read_id]
                      == read_len_q[ready_read_id]);
+                r_stream_error_q <= read_error_q[ready_read_id];
             end
             else if (r_stream_valid_q && s_axi_rready) begin
                 if (r_stream_last_q) begin
@@ -191,6 +205,7 @@ module axi_memory_model
                     read_beat_q[r_stream_id_q]  <= '0;
                     r_stream_valid_q <= 1'b0;
                     r_stream_last_q  <= 1'b0;
+                    r_stream_error_q <= 1'b0;
                 end
                 else begin
                     read_beat_q[r_stream_id_q]
@@ -218,6 +233,8 @@ module axi_memory_model
             write_id_q     <= '0;
             bvalid_q       <= 1'b0;
             bid_q          <= '0;
+            write_error_q  <= 1'b0;
+            bresp_q        <= AXI_RESP_OKAY;
         end
         else begin
             if (bvalid_q && s_axi_bready)
@@ -229,12 +246,14 @@ module axi_memory_model
                 write_len_q    <= s_axi_awlen;
                 write_beat_q   <= '0;
                 write_id_q     <= s_axi_awid;
+                write_error_q  <= force_write_error;
             end
             else if (s_axi_wvalid && s_axi_wready) begin
                 for (write_byte_number = 0;
                      write_byte_number < AXI_BYTES;
                      write_byte_number = write_byte_number + 1) begin
-                    if (s_axi_wstrb[write_byte_number]) begin
+                    if (s_axi_wstrb[write_byte_number]
+                        && !write_error_q) begin
                         memory[write_base_q
                                + (write_beat_q * AXI_BYTES)
                                + write_byte_number]
@@ -248,6 +267,8 @@ module axi_memory_model
                     write_beat_q   <= '0;
                     bvalid_q       <= 1'b1;
                     bid_q          <= write_id_q;
+                    bresp_q        <= write_error_q
+                                      ? AXI_RESP_SLVERR : AXI_RESP_OKAY;
                 end
                 else begin
                     write_beat_q <= write_beat_q + 1'b1;

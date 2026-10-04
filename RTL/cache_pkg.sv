@@ -8,7 +8,7 @@ package cache_pkg;
     parameter int AXI_DATA_WIDTH   = 32;
     parameter int REQ_ID_WIDTH     = 4;
 
-    // Phase 6 concurrency parameters.
+    // Non-blocking cache parameters.
     parameter int NUM_MSHRS        = 4;
     parameter int MERGE_DEPTH      = 4;
     parameter int RESPONSE_DEPTH   = 16;
@@ -35,6 +35,9 @@ package cache_pkg;
     localparam logic [2:0] AXI_WORD_SIZE = $clog2(AXI_BYTES);
     localparam logic [1:0] AXI_BURST_INCR = 2'b01;
     localparam logic [1:0] AXI_RESP_OKAY  = 2'b00;
+    localparam logic [1:0] AXI_RESP_EXOKAY = 2'b01;
+    localparam logic [1:0] AXI_RESP_SLVERR = 2'b10;
+    localparam logic [1:0] AXI_RESP_DECERR = 2'b11;
 
     typedef logic [LINE_BITS-1:0] line_t;
     typedef logic [TAG_BITS-1:0] tag_t;
@@ -59,7 +62,8 @@ package cache_pkg;
         MSHR_REFILL_WAIT,
         MSHR_PREPARE,
         MSHR_APPLY,
-        MSHR_INSTALL_PENDING
+        MSHR_INSTALL_PENDING,
+        MSHR_ERROR_RESPONSE
     } mshr_state_t;
 
     typedef enum logic [1:0] {
@@ -68,5 +72,15 @@ package cache_pkg;
         WB_DATA,
         WB_RESPONSE
     } writeback_state_t;
+
+    // A maintenance request performs a full clean-and-invalidate operation.
+    // Dirty lines are written to memory before they are invalidated.
+    typedef enum logic [2:0] {
+        FLUSH_IDLE,
+        FLUSH_CHECK,
+        FLUSH_ADDRESS,
+        FLUSH_DATA,
+        FLUSH_RESPONSE
+    } flush_state_t;
 
 endpackage

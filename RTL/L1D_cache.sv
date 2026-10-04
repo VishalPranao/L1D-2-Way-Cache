@@ -18,6 +18,14 @@ module l1d_cache
     input  logic                      cpu_rsp_ready,
     output logic [REQ_ID_WIDTH-1:0]   cpu_rsp_id,
     output logic [DATA_WIDTH-1:0]     cpu_rsp_rdata,
+    output logic                      cpu_rsp_error,
+
+    // Full-cache clean and invalidate command.  The request is accepted only
+    // after ordinary CPU traffic has drained.  flush_done is a one-cycle pulse.
+    input  logic                      flush_valid,
+    output logic                      flush_ready,
+    output logic                      flush_done,
+    output logic                      flush_error,
 
     // AXI4 write-address channel.
     output logic                      m_axi_awvalid,
@@ -121,6 +129,7 @@ module l1d_cache
     line_t                       mshr_refill_line_q [0:NUM_MSHRS-1];
     line_t                       mshr_work_line_q [0:NUM_MSHRS-1];
     logic                        mshr_line_dirty_q [0:NUM_MSHRS-1];
+    logic                        mshr_refill_error_q [0:NUM_MSHRS-1];
     axi_beat_t                   mshr_refill_beat_q [0:NUM_MSHRS-1];
 
     logic [MERGE_COUNT_WIDTH-1:0] mshr_req_count_q [0:NUM_MSHRS-1];
@@ -168,6 +177,14 @@ module l1d_cache
     logic                        apply_select_valid;
     mshr_index_t                 apply_select_index;
     logic                        apply_fire;
+    logic                        error_response_fire;
+
+    // Each arbiter begins its next search after its previous winner.
+    mshr_index_t                 writeback_rr_q;
+    mshr_index_t                 ar_rr_q;
+    mshr_index_t                 install_rr_q;
+    mshr_index_t                 apply_rr_q;
+    logic                        response_rr_q;
 
     // ---------------------------------------------------------------------
     // Response FIFO and response-source arbitration
@@ -177,7 +194,23 @@ module l1d_cache
     logic                        response_push_ready;
     logic [REQ_ID_WIDTH-1:0]     response_push_id;
     logic [DATA_WIDTH-1:0]       response_push_data;
+    logic                        response_push_error;
+    logic                        response_fifo_empty;
     logic                        lookup_hit_complete;
+    logic                        lookup_response_candidate;
+    logic                        mshr_response_candidate;
+
+    // ---------------------------------------------------------------------
+    // Full-cache flush controller
+    // ---------------------------------------------------------------------
+
+    flush_state_t                flush_state_q;
+    logic [INDEX_BITS-1:0]       flush_set_q;
+    way_t                        flush_way_q;
+    logic [ADDR_WIDTH-1:0]       flush_addr_q;
+    line_t                       flush_line_q;
+    axi_beat_t                   flush_beat_q;
+    logic                        any_mshr_valid;
 
     // Loop variables are deliberately unique to their processes. This avoids
     // ModelSim multiple-driver warnings on procedural integer variables.
@@ -190,13 +223,16 @@ module l1d_cache
     integer match_scan_number;
     integer victim_conflict_scan_number;
     integer free_scan_number;
-    integer writeback_scan_number;
-    integer ar_scan_number;
-    integer install_scan_number;
-    integer apply_scan_number;
+    integer writeback_rr_scan_number;
+    integer writeback_rr_candidate_number;
+    integer ar_rr_scan_number;
+    integer ar_rr_candidate_number;
+    integer install_rr_scan_number;
+    integer install_rr_candidate_number;
+    integer apply_rr_scan_number;
+    integer apply_rr_candidate_number;
     integer prepare_scan_number;
-    integer assertion_outer_number;
-    integer assertion_inner_number;
+    integer active_scan_number;
 
     function automatic logic state_accepts_merge(
         input mshr_state_t state_value
@@ -222,10 +258,13 @@ module l1d_cache
         .push_ready (response_push_ready),
         .push_id    (response_push_id),
         .push_data  (response_push_data),
+        .push_error (response_push_error),
         .pop_valid  (cpu_rsp_valid),
         .pop_ready  (cpu_rsp_ready),
         .pop_id     (cpu_rsp_id),
-        .pop_data   (cpu_rsp_rdata)
+        .pop_data   (cpu_rsp_rdata),
+        .pop_error  (cpu_rsp_error),
+        .empty      (response_fifo_empty)
     );
 
     // ---------------------------------------------------------------------
@@ -350,20 +389,24 @@ module l1d_cache
     // Arbiters
     // ---------------------------------------------------------------------
 
+    // Round-robin arbitration avoids permanently favoring low-numbered MSHRs.
     always_comb begin
         writeback_select_valid = 1'b0;
         writeback_select_index = '0;
+        writeback_rr_candidate_number = 0;
 
-        for (writeback_scan_number = 0;
-             writeback_scan_number < NUM_MSHRS;
-             writeback_scan_number = writeback_scan_number + 1) begin
+        for (writeback_rr_scan_number = 0;
+             writeback_rr_scan_number < NUM_MSHRS;
+             writeback_rr_scan_number = writeback_rr_scan_number + 1) begin
+            writeback_rr_candidate_number =
+                (writeback_rr_q + writeback_rr_scan_number) % NUM_MSHRS;
             if (!writeback_select_valid
-                && mshr_valid_q[writeback_scan_number]
-                && mshr_state_q[writeback_scan_number]
+                && mshr_valid_q[writeback_rr_candidate_number]
+                && mshr_state_q[writeback_rr_candidate_number]
                    == MSHR_WRITEBACK_PENDING) begin
                 writeback_select_valid = 1'b1;
                 writeback_select_index =
-                    mshr_index_t'(writeback_scan_number);
+                    mshr_index_t'(writeback_rr_candidate_number);
             end
         end
     end
@@ -371,16 +414,19 @@ module l1d_cache
     always_comb begin
         ar_select_valid = 1'b0;
         ar_select_index = '0;
+        ar_rr_candidate_number = 0;
 
-        for (ar_scan_number = 0;
-             ar_scan_number < NUM_MSHRS;
-             ar_scan_number = ar_scan_number + 1) begin
+        for (ar_rr_scan_number = 0;
+             ar_rr_scan_number < NUM_MSHRS;
+             ar_rr_scan_number = ar_rr_scan_number + 1) begin
+            ar_rr_candidate_number =
+                (ar_rr_q + ar_rr_scan_number) % NUM_MSHRS;
             if (!ar_select_valid
-                && mshr_valid_q[ar_scan_number]
-                && mshr_state_q[ar_scan_number]
+                && mshr_valid_q[ar_rr_candidate_number]
+                && mshr_state_q[ar_rr_candidate_number]
                    == MSHR_REFILL_REQUEST) begin
                 ar_select_valid = 1'b1;
-                ar_select_index = mshr_index_t'(ar_scan_number);
+                ar_select_index = mshr_index_t'(ar_rr_candidate_number);
             end
         end
     end
@@ -388,17 +434,20 @@ module l1d_cache
     always_comb begin
         install_select_valid = 1'b0;
         install_select_index = '0;
+        install_rr_candidate_number = 0;
 
-        for (install_scan_number = 0;
-             install_scan_number < NUM_MSHRS;
-             install_scan_number = install_scan_number + 1) begin
+        for (install_rr_scan_number = 0;
+             install_rr_scan_number < NUM_MSHRS;
+             install_rr_scan_number = install_rr_scan_number + 1) begin
+            install_rr_candidate_number =
+                (install_rr_q + install_rr_scan_number) % NUM_MSHRS;
             if (!install_select_valid
-                && mshr_valid_q[install_scan_number]
-                && mshr_state_q[install_scan_number]
+                && mshr_valid_q[install_rr_candidate_number]
+                && mshr_state_q[install_rr_candidate_number]
                    == MSHR_INSTALL_PENDING) begin
                 install_select_valid = 1'b1;
                 install_select_index =
-                    mshr_index_t'(install_scan_number);
+                    mshr_index_t'(install_rr_candidate_number);
             end
         end
     end
@@ -408,15 +457,20 @@ module l1d_cache
     always_comb begin
         apply_select_valid = 1'b0;
         apply_select_index = '0;
+        apply_rr_candidate_number = 0;
 
-        for (apply_scan_number = 0;
-             apply_scan_number < NUM_MSHRS;
-             apply_scan_number = apply_scan_number + 1) begin
+        for (apply_rr_scan_number = 0;
+             apply_rr_scan_number < NUM_MSHRS;
+             apply_rr_scan_number = apply_rr_scan_number + 1) begin
+            apply_rr_candidate_number =
+                (apply_rr_q + apply_rr_scan_number) % NUM_MSHRS;
             if (!apply_select_valid
-                && mshr_valid_q[apply_scan_number]
-                && mshr_state_q[apply_scan_number] == MSHR_APPLY) begin
+                && mshr_valid_q[apply_rr_candidate_number]
+                && ((mshr_state_q[apply_rr_candidate_number] == MSHR_APPLY)
+                    || (mshr_state_q[apply_rr_candidate_number]
+                        == MSHR_ERROR_RESPONSE))) begin
                 apply_select_valid = 1'b1;
-                apply_select_index = mshr_index_t'(apply_scan_number);
+                apply_select_index = mshr_index_t'(apply_rr_candidate_number);
             end
         end
     end
@@ -425,14 +479,32 @@ module l1d_cache
     // Lookup decisions and response arbitration
     // ---------------------------------------------------------------------
 
-    assign cpu_req_ready = (lookup_state_q == LOOKUP_IDLE)
-                           && !install_fire;
+    always_comb begin
+        any_mshr_valid = 1'b0;
+        for (active_scan_number = 0;
+             active_scan_number < NUM_MSHRS;
+             active_scan_number = active_scan_number + 1) begin
+            any_mshr_valid = any_mshr_valid || mshr_valid_q[active_scan_number];
+        end
+    end
 
-    assign lookup_hit_complete =
-        (lookup_state_q == LOOKUP_COMPARE)
-        && !install_fire
-        && lookup_hit
-        && response_push_ready;
+    assign flush_ready = (flush_state_q == FLUSH_IDLE)
+                         && (lookup_state_q == LOOKUP_IDLE)
+                         && !any_mshr_valid
+                         && !ar_hold_valid_q
+                         && (writeback_state_q == WB_IDLE)
+                         && response_fifo_empty;
+
+    // A pending flush blocks new CPU requests, allowing existing traffic to
+    // drain until flush_ready becomes true.
+    assign cpu_req_ready = (lookup_state_q == LOOKUP_IDLE)
+                           && !install_fire
+                           && (flush_state_q == FLUSH_IDLE)
+                           && !flush_valid;
+
+    assign lookup_response_candidate =
+        (lookup_state_q == LOOKUP_COMPARE) && !install_fire && lookup_hit;
+    assign mshr_response_candidate = apply_select_valid;
 
     assign merge_fire =
         (lookup_state_q == LOOKUP_COMPARE)
@@ -451,33 +523,41 @@ module l1d_cache
         && free_mshr_valid
         && lookup_victim_available;
 
-    // Cache hits have response priority. One APPLY entry may produce a second
-    // source, but only one item is pushed into the FIFO each cycle.
-    assign apply_fire = apply_select_valid
-                        && response_push_ready
-                        && !lookup_hit_complete;
-
     always_comb begin
         response_push_valid = 1'b0;
         response_push_id    = '0;
         response_push_data  = '0;
+        response_push_error = 1'b0;
+        lookup_hit_complete = 1'b0;
+        apply_fire           = 1'b0;
+        error_response_fire  = 1'b0;
 
-        if (lookup_hit_complete) begin
+        // Alternate priority when a cache hit and an MSHR response are both
+        // ready.  The selected source stays stable while the FIFO is full.
+        if (lookup_response_candidate
+            && (!mshr_response_candidate || !response_rr_q)) begin
             response_push_valid = 1'b1;
             response_push_id    = lookup_req_id_q;
             response_push_data  = lookup_req_write_q
                 ? '0 : lookup_selected_word;
+            lookup_hit_complete = response_push_ready;
         end
-        else if (apply_fire) begin
+        else if (mshr_response_candidate) begin
             response_push_valid = 1'b1;
             response_push_id = mshr_req_id_q
                 [apply_select_index]
                 [mshr_process_index_q[apply_select_index]];
 
-            if (mshr_req_write_q
+            if (mshr_state_q[apply_select_index] == MSHR_ERROR_RESPONSE) begin
+                response_push_data  = '0;
+                response_push_error = 1'b1;
+                error_response_fire = response_push_ready;
+            end
+            else if (mshr_req_write_q
                 [apply_select_index]
                 [mshr_process_index_q[apply_select_index]]) begin
                 response_push_data = '0;
+                apply_fire = response_push_ready;
             end
             else begin
                 response_push_data = mshr_work_line_q[apply_select_index]
@@ -485,6 +565,7 @@ module l1d_cache
                       [apply_select_index]
                       [mshr_process_index_q[apply_select_index]]
                       * DATA_WIDTH) +: DATA_WIDTH];
+                apply_fire = response_push_ready;
             end
         end
     end
@@ -503,7 +584,7 @@ module l1d_cache
                     lookup_state_d = LOOKUP_RETRY;
                 end
                 else if (lookup_hit) begin
-                    if (response_push_ready)
+                    if (lookup_hit_complete)
                         lookup_state_d = LOOKUP_IDLE;
                 end
                 else if (merge_fire || allocate_fire) begin
@@ -545,14 +626,34 @@ module l1d_cache
 
         m_axi_bready = 1'b0;
 
-        case (writeback_state_q)
-            WB_ADDRESS:  m_axi_awvalid = 1'b1;
-            WB_DATA:     m_axi_wvalid  = 1'b1;
-            WB_RESPONSE: m_axi_bready  = 1'b1;
-            default: begin
-                // WB_IDLE only performs arbitration.
-            end
-        endcase
+        if (flush_state_q != FLUSH_IDLE) begin
+            // Flush starts only after all MSHRs drain, so it can own the
+            // serialized AXI write channels without another level of queues.
+            m_axi_awid   = '0;
+            m_axi_awaddr = flush_addr_q;
+            m_axi_wdata  = flush_line_q
+                [(flush_beat_q * AXI_DATA_WIDTH) +: AXI_DATA_WIDTH];
+            m_axi_wlast  = (flush_beat_q == AXI_BEATS_PER_LINE - 1);
+
+            case (flush_state_q)
+                FLUSH_ADDRESS:  m_axi_awvalid = 1'b1;
+                FLUSH_DATA:     m_axi_wvalid  = 1'b1;
+                FLUSH_RESPONSE: m_axi_bready  = 1'b1;
+                default: begin
+                    // FLUSH_CHECK only examines the cache arrays.
+                end
+            endcase
+        end
+        else begin
+            case (writeback_state_q)
+                WB_ADDRESS:  m_axi_awvalid = 1'b1;
+                WB_DATA:     m_axi_wvalid  = 1'b1;
+                WB_RESPONSE: m_axi_bready  = 1'b1;
+                default: begin
+                    // WB_IDLE only performs arbitration.
+                end
+            endcase
+        end
     end
 
     assign m_axi_arvalid = ar_hold_valid_q;
@@ -584,6 +685,21 @@ module l1d_cache
             writeback_beat_q  <= '0;
             ar_hold_valid_q   <= 1'b0;
             ar_hold_index_q   <= '0;
+
+            writeback_rr_q <= '0;
+            ar_rr_q        <= '0;
+            install_rr_q   <= '0;
+            apply_rr_q     <= '0;
+            response_rr_q  <= 1'b0;
+
+            flush_state_q <= FLUSH_IDLE;
+            flush_set_q   <= '0;
+            flush_way_q   <= '0;
+            flush_addr_q  <= '0;
+            flush_line_q  <= '0;
+            flush_beat_q  <= '0;
+            flush_done    <= 1'b0;
+            flush_error   <= 1'b0;
 
             for (capture_way_number = 0;
                  capture_way_number < NUM_WAYS;
@@ -626,6 +742,7 @@ module l1d_cache
                 mshr_refill_line_q[prepare_scan_number]    <= '0;
                 mshr_work_line_q[prepare_scan_number]      <= '0;
                 mshr_line_dirty_q[prepare_scan_number]     <= 1'b0;
+                mshr_refill_error_q[prepare_scan_number]   <= 1'b0;
                 mshr_refill_beat_q[prepare_scan_number]    <= '0;
                 mshr_req_count_q[prepare_scan_number]      <= '0;
                 mshr_process_index_q[prepare_scan_number]  <= '0;
@@ -648,6 +765,14 @@ module l1d_cache
         end
         else begin
             lookup_state_q <= lookup_state_d;
+            flush_done  <= 1'b0;
+            flush_error <= 1'b0;
+
+            if (response_push_valid && response_push_ready
+                && lookup_response_candidate
+                && mshr_response_candidate) begin
+                response_rr_q <= ~response_rr_q;
+            end
 
             // Stage 0 request capture.
             if (lookup_state_q == LOOKUP_IDLE
@@ -738,6 +863,7 @@ module l1d_cache
                 mshr_refill_line_q[free_mshr_index] <= '0;
                 mshr_work_line_q[free_mshr_index]   <= '0;
                 mshr_line_dirty_q[free_mshr_index]  <= 1'b0;
+                mshr_refill_error_q[free_mshr_index] <= 1'b0;
                 mshr_refill_beat_q[free_mshr_index] <= '0;
                 mshr_req_count_q[free_mshr_index]   <= 1;
                 mshr_process_index_q[free_mshr_index] <= '0;
@@ -783,6 +909,7 @@ module l1d_cache
                 WB_IDLE: begin
                     if (writeback_select_valid) begin
                         writeback_index_q <= writeback_select_index;
+                        writeback_rr_q <= writeback_select_index + 1'b1;
                         writeback_beat_q  <= '0;
                         writeback_state_q <= WB_ADDRESS;
                         mshr_state_q[writeback_select_index]
@@ -813,8 +940,20 @@ module l1d_cache
                 WB_RESPONSE: begin
                     if (m_axi_bvalid && m_axi_bready) begin
                         writeback_state_q <= WB_IDLE;
-                        mshr_state_q[writeback_index_q]
-                            <= MSHR_REFILL_REQUEST;
+                        mshr_process_index_q[writeback_index_q] <= '0;
+
+                        if ((m_axi_bresp == AXI_RESP_OKAY)
+                            && (m_axi_bid == writeback_index_q)) begin
+                            mshr_state_q[writeback_index_q]
+                                <= MSHR_REFILL_REQUEST;
+                        end
+                        else begin
+                            // Keep the dirty victim in the cache.  After all
+                            // dependent CPU requests receive an error, the way
+                            // reservation is released without changing data.
+                            mshr_state_q[writeback_index_q]
+                                <= MSHR_ERROR_RESPONSE;
+                        end
                     end
                 end
 
@@ -825,6 +964,7 @@ module l1d_cache
             if (!ar_hold_valid_q && ar_select_valid) begin
                 ar_hold_valid_q <= 1'b1;
                 ar_hold_index_q <= ar_select_index;
+                ar_rr_q <= ar_select_index + 1'b1;
                 mshr_state_q[ar_select_index] <= MSHR_REFILL_ISSUE;
             end
 
@@ -833,6 +973,7 @@ module l1d_cache
                 mshr_state_q[ar_hold_index_q] <= MSHR_REFILL_WAIT;
                 mshr_refill_line_q[ar_hold_index_q] <= '0;
                 mshr_refill_beat_q[ar_hold_index_q] <= '0;
+                mshr_refill_error_q[ar_hold_index_q] <= 1'b0;
             end
 
             // RID independently routes every returned read beat.
@@ -842,9 +983,28 @@ module l1d_cache
                      +: AXI_DATA_WIDTH]
                     <= m_axi_rdata;
 
-                if (m_axi_rlast) begin
+                if (m_axi_rresp != AXI_RESP_OKAY)
+                    mshr_refill_error_q[m_axi_rid] <= 1'b1;
+
+                // Finish on RLAST, or abort if the expected last beat arrives
+                // without RLAST.  Either malformed length case becomes a CPU
+                // error rather than installing a partial cache line.
+                if (m_axi_rlast
+                    || (mshr_refill_beat_q[m_axi_rid]
+                        == AXI_BEATS_PER_LINE - 1)) begin
                     mshr_refill_beat_q[m_axi_rid] <= '0;
-                    mshr_state_q[m_axi_rid] <= MSHR_PREPARE;
+                    mshr_process_index_q[m_axi_rid] <= '0;
+
+                    if (mshr_refill_error_q[m_axi_rid]
+                        || (m_axi_rresp != AXI_RESP_OKAY)
+                        || (m_axi_rlast
+                            != (mshr_refill_beat_q[m_axi_rid]
+                                == AXI_BEATS_PER_LINE - 1))) begin
+                        mshr_state_q[m_axi_rid] <= MSHR_ERROR_RESPONSE;
+                    end
+                    else begin
+                        mshr_state_q[m_axi_rid] <= MSHR_PREPARE;
+                    end
                 end
                 else begin
                     mshr_refill_beat_q[m_axi_rid]
@@ -869,6 +1029,7 @@ module l1d_cache
 
             // Apply one merged operation and create one CPU response per cycle.
             if (apply_fire) begin
+                apply_rr_q <= apply_select_index + 1'b1;
                 if (mshr_req_write_q
                     [apply_select_index]
                     [mshr_process_index_q[apply_select_index]]) begin
@@ -910,8 +1071,30 @@ module l1d_cache
                 end
             end
 
+            // Error responses use the same ordered per-MSHR request list as
+            // successful refills.  The original victim remains untouched.
+            if (error_response_fire) begin
+                apply_rr_q <= apply_select_index + 1'b1;
+
+                if ({1'b0, mshr_process_index_q[apply_select_index]}
+                    == (mshr_req_count_q[apply_select_index] - 1'b1)) begin
+                    reserved_array
+                        [mshr_set_index_q[apply_select_index]]
+                        [mshr_victim_way_q[apply_select_index]] <= 1'b0;
+                    mshr_valid_q[apply_select_index] <= 1'b0;
+                    mshr_state_q[apply_select_index] <= MSHR_FREE;
+                    mshr_req_count_q[apply_select_index] <= '0;
+                    mshr_process_index_q[apply_select_index] <= '0;
+                end
+                else begin
+                    mshr_process_index_q[apply_select_index]
+                        <= mshr_process_index_q[apply_select_index] + 1'b1;
+                end
+            end
+
             // Single array-write-port installation arbiter.
             if (install_fire) begin
+                install_rr_q <= install_select_index + 1'b1;
                 data_array
                     [mshr_set_index_q[install_select_index]]
                     [mshr_victim_way_q[install_select_index]]
@@ -942,80 +1125,106 @@ module l1d_cache
                 mshr_process_index_q[install_select_index] <= '0;
             end
 
-`ifndef SYNTHESIS
-            if (m_axi_rvalid
-                && (!mshr_valid_q[m_axi_rid]
-                    || mshr_state_q[m_axi_rid] != MSHR_REFILL_WAIT)) begin
-                $fatal(1,
-                    "AXI RID %0d does not identify an MSHR waiting for data",
-                    m_axi_rid);
-            end
+            // -------------------------------------------------------------
+            // Full-cache clean and invalidate controller
+            // -------------------------------------------------------------
 
-            if (m_axi_bvalid && m_axi_bready) begin
-                if (m_axi_bresp != AXI_RESP_OKAY)
-                    $fatal(1, "AXI write response error: BRESP=%02b",
-                           m_axi_bresp);
-
-                if (m_axi_bid != writeback_index_q)
-                    $fatal(1,
-                        "AXI BID %0d does not match writeback MSHR %0d",
-                        m_axi_bid, writeback_index_q);
-            end
-
-            if (m_axi_rvalid && m_axi_rready) begin
-                if (m_axi_rresp != AXI_RESP_OKAY)
-                    $fatal(1, "AXI read response error: RRESP=%02b",
-                           m_axi_rresp);
-
-                if (m_axi_rlast
-                    != (mshr_refill_beat_q[m_axi_rid]
-                        == AXI_BEATS_PER_LINE - 1)) begin
-                    $fatal(1,
-                        "AXI RLAST arrived on wrong beat for MSHR %0d",
-                        m_axi_rid);
-                end
-            end
-
-            if (way_hit == {NUM_WAYS{1'b1}})
-                $fatal(1, "Both cache ways hit the same request");
-
-            for (assertion_outer_number = 0;
-                 assertion_outer_number < NUM_MSHRS;
-                 assertion_outer_number = assertion_outer_number + 1) begin
-                if (mshr_valid_q[assertion_outer_number]
-                    && mshr_req_count_q[assertion_outer_number]
-                       > MERGE_DEPTH) begin
-                    $fatal(1, "MSHR %0d merge queue overflow",
-                           assertion_outer_number);
-                end
-
-                for (assertion_inner_number = assertion_outer_number + 1;
-                     assertion_inner_number < NUM_MSHRS;
-                     assertion_inner_number = assertion_inner_number + 1) begin
-                    if (mshr_valid_q[assertion_outer_number]
-                        && mshr_valid_q[assertion_inner_number]
-                        && mshr_line_addr_q[assertion_outer_number]
-                           == mshr_line_addr_q[assertion_inner_number]) begin
-                        $fatal(1,
-                            "Duplicate MSHRs %0d and %0d own the same line",
-                            assertion_outer_number,
-                            assertion_inner_number);
-                    end
-
-                    if (mshr_valid_q[assertion_outer_number]
-                        && mshr_valid_q[assertion_inner_number]
-                        && mshr_set_index_q[assertion_outer_number]
-                           == mshr_set_index_q[assertion_inner_number]
-                        && mshr_victim_way_q[assertion_outer_number]
-                           == mshr_victim_way_q[assertion_inner_number]) begin
-                        $fatal(1,
-                            "MSHRs %0d and %0d reserve the same cache way",
-                            assertion_outer_number,
-                            assertion_inner_number);
+            case (flush_state_q)
+                FLUSH_IDLE: begin
+                    if (flush_valid && flush_ready) begin
+                        flush_set_q  <= '0;
+                        flush_way_q  <= '0;
+                        flush_beat_q <= '0;
+                        flush_state_q <= FLUSH_CHECK;
                     end
                 end
-            end
-`endif
+
+                FLUSH_CHECK: begin
+                    if (valid_array[flush_set_q][flush_way_q]
+                        && dirty_array[flush_set_q][flush_way_q]) begin
+                        flush_addr_q <= {
+                            tag_array[flush_set_q][flush_way_q],
+                            flush_set_q,
+                            {OFFSET_BITS{1'b0}}
+                        };
+                        flush_line_q <= data_array[flush_set_q][flush_way_q];
+                        flush_beat_q <= '0;
+                        flush_state_q <= FLUSH_ADDRESS;
+                    end
+                    else begin
+                        // Clean lines require no memory traffic.
+                        valid_array[flush_set_q][flush_way_q] <= 1'b0;
+                        dirty_array[flush_set_q][flush_way_q] <= 1'b0;
+
+                        if ((flush_set_q == NUM_SETS - 1)
+                            && (flush_way_q == NUM_WAYS - 1)) begin
+                            flush_state_q <= FLUSH_IDLE;
+                            flush_done <= 1'b1;
+                        end
+                        else if (flush_way_q == NUM_WAYS - 1) begin
+                            flush_way_q <= '0;
+                            flush_set_q <= flush_set_q + 1'b1;
+                        end
+                        else begin
+                            flush_way_q <= flush_way_q + 1'b1;
+                        end
+                    end
+                end
+
+                FLUSH_ADDRESS: begin
+                    if (m_axi_awvalid && m_axi_awready) begin
+                        flush_beat_q <= '0;
+                        flush_state_q <= FLUSH_DATA;
+                    end
+                end
+
+                FLUSH_DATA: begin
+                    if (m_axi_wvalid && m_axi_wready) begin
+                        if (m_axi_wlast) begin
+                            flush_beat_q <= '0;
+                            flush_state_q <= FLUSH_RESPONSE;
+                        end
+                        else begin
+                            flush_beat_q <= flush_beat_q + 1'b1;
+                        end
+                    end
+                end
+
+                FLUSH_RESPONSE: begin
+                    if (m_axi_bvalid && m_axi_bready) begin
+                        if ((m_axi_bresp != AXI_RESP_OKAY)
+                            || (m_axi_bid != '0)) begin
+                            // Do not invalidate a dirty line whose writeback
+                            // failed.  Software can retry the flush safely.
+                            flush_state_q <= FLUSH_IDLE;
+                            flush_done  <= 1'b1;
+                            flush_error <= 1'b1;
+                        end
+                        else begin
+                            valid_array[flush_set_q][flush_way_q] <= 1'b0;
+                            dirty_array[flush_set_q][flush_way_q] <= 1'b0;
+
+                            if ((flush_set_q == NUM_SETS - 1)
+                                && (flush_way_q == NUM_WAYS - 1)) begin
+                                flush_state_q <= FLUSH_IDLE;
+                                flush_done <= 1'b1;
+                            end
+                            else if (flush_way_q == NUM_WAYS - 1) begin
+                                flush_way_q <= '0;
+                                flush_set_q <= flush_set_q + 1'b1;
+                                flush_state_q <= FLUSH_CHECK;
+                            end
+                            else begin
+                                flush_way_q <= flush_way_q + 1'b1;
+                                flush_state_q <= FLUSH_CHECK;
+                            end
+                        end
+                    end
+                end
+
+                default: flush_state_q <= FLUSH_IDLE;
+            endcase
+
         end
     end
 
